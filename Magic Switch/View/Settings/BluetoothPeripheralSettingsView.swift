@@ -62,8 +62,8 @@ struct BluetoothPeripheralSettingsView: View {
       // peripheral over instead of leaving it floating.
       bluetoothStore.sendPeripheralToPeer(peripheral)
     case .disconnected:
-      // Ask the peer to release first if it's holding the peripheral —
-      // pairing locally without that step would just hang.
+      // Ask the peer to release first if it's holding the peripheral — opening
+      // this Mac's existing connection while the peer holds it would fail.
       bluetoothStore.takePeripheralFromPeer(peripheral)
     case .connecting, .releasing:
       break  // Handoff in flight; button is disabled in the UI.
@@ -291,16 +291,10 @@ private struct PeripheralRowView: View {
     .help("Set the icon for \(peripheral.name). Choose Automatic to detect it from the device.")
   }
 
-  /// Shared fixed-width label so the pill is the same size across its
-  /// resting states instead of hugging each title. The floor clears
-  /// "Connect" (51.2pt) and "Pairing…" (51.9pt at the 13pt control font) —
-  /// the 54 buys the latter a couple of points of headroom against
-  /// font-metric drift, where a 52 floor would sit 0.1pt from a
-  /// connecting-state nudge — so rows align and a Connect ↔ Release flip
-  /// doesn't nudge; sizing the floor to the rarely-seen "Releasing…"
-  /// (68.8pt) instead left the two resting titles swimming in dead space,
-  /// and the brief growth during a release reads as activity rather than
-  /// jitter.
+  /// Shared fixed-width label so the pill stays aligned across its resting
+  /// Connect and Release states. Transient Connecting and Releasing titles may
+  /// grow briefly; sizing every row for those rare states would leave the two
+  /// resting titles swimming in dead space.
   private func actionLabel(_ title: String) -> some View {
     Text(title).frame(minWidth: 54)
   }
@@ -317,9 +311,9 @@ private struct PeripheralRowView: View {
             : "No peer Mac is currently available to take this peripheral. Releasing is disabled so it isn't left disconnected from both Macs."
         )
     case .connecting:
-      Button(action: {}) { actionLabel("Pairing…") }
+      Button(action: {}) { actionLabel("Connecting…") }
         .disabled(true)
-        .help("Pairing in progress…")
+        .help("Connecting with the existing Bluetooth pairing…")
     case .releasing:
       Button(action: {}) { actionLabel("Releasing…") }
         .disabled(true)

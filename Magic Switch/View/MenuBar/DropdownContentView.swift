@@ -4,7 +4,7 @@ import Combine
 /// A clickable row inside the status-bar dropdown. The key trick: `mouseDown`
 /// runs the action then *consumes the mouse-up* off the window queue, so the
 /// tracked `NSMenu` never sees a selection and doesn't dismiss — that's what
-/// lets the dropdown stay open while a peripheral pairs. Disabled rows ignore
+/// lets the dropdown stay open while a peripheral connects. Disabled rows ignore
 /// clicks (used for an unreachable Mac). Adapted from `TapControl` in the
 /// wiz-light-controller reference.
 final class MenuRowControl: NSControl {
@@ -92,7 +92,7 @@ final class MenuRowControl: NSControl {
 /// SwiftUI controls don't track inside a menu. Mirrors the old `MenuBarView`
 /// NSMenu — optional update row, Macs, Peripherals, Settings, Quit — but the
 /// rows are live (it observes the stores) and a peripheral tap keeps the menu
-/// open so progress ("Pairing…") and errors show inline. Pattern adapted from
+/// open so progress ("Connecting…") and errors show inline. Pattern adapted from
 /// wiz-light-controller's `DropdownContentView`.
 final class DropdownContentView: NSView {
   // MARK: - Dependencies
@@ -227,7 +227,7 @@ final class DropdownContentView: NSView {
   }
 
   /// Resize to fit the current content at the fixed width, so the menu measures
-  /// the right item size (it changes as peripherals pair / errors appear). Width
+  /// the right item size (it changes as peripherals connect / errors appear). Width
   /// is pinned, not taken from `fittingSize`, because AppKit reports widths lazily.
   func updateFrameToFit() {
     setFrameSize(NSSize(width: Self.panelWidth, height: max(1, fittingSize.height)))
@@ -272,7 +272,7 @@ final class DropdownContentView: NSView {
 
   private func makeMacRow(_ device: NetworkDevice) -> NSView {
     let reachable = networkStore.isSwitchable(device)
-    // Don't allow a full-set switch while any peripheral is mid pair/handoff —
+    // Don't allow a full-set switch while any peripheral is mid connection/handoff —
     // it would issue a re-entrant connect/release on a peripheral that's already
     // transitioning. (The per-peripheral rows already disable themselves during
     // their own transition; this is the matching guard for the all-at-once row.)
@@ -310,7 +310,7 @@ final class DropdownContentView: NSView {
     }
     // A disconnected peripheral is always clickable — take it (locally over
     // Bluetooth if there's no peer to ask). A connected one can only be *sent*,
-    // so it greys out when no Mac is reachable to hand it to. A pairing row is
+    // so it greys out when no Mac is reachable to hand it to. A connecting row is
     // disabled while in flight.
     let enabled: Bool
     switch state {
@@ -319,8 +319,8 @@ final class DropdownContentView: NSView {
     case .disconnected: enabled = true
     }
     row.isEnabled = enabled
-    // Dim only the "nowhere to send it" case; a pairing row keeps its normal
-    // colour alongside the "Pairing…" label.
+    // Dim only the "nowhere to send it" case; a connecting row keeps its normal
+    // colour alongside the "Connecting…" label.
     let dimmed = state == .connected && !canSwitch
     let textColor: NSColor = dimmed ? .tertiaryLabelColor : .labelColor
 
@@ -347,7 +347,7 @@ final class DropdownContentView: NSView {
       }
       top.addArrangedSubview(symbolView("checkmark", color: .controlAccentColor))
     case .connecting:
-      top.addArrangedSubview(caption("Pairing…", color: .secondaryLabelColor))
+      top.addArrangedSubview(caption("Connecting…", color: .secondaryLabelColor))
     case .releasing:
       top.addArrangedSubview(caption("Releasing…", color: .secondaryLabelColor))
     case .disconnected:
@@ -391,7 +391,7 @@ final class DropdownContentView: NSView {
     let stateSuffix: String
     switch state {
     case .connected: stateSuffix = ", on this Mac" + (battery.map { ", battery \($0)%" } ?? "")
-    case .connecting: stateSuffix = ", pairing"
+    case .connecting: stateSuffix = ", connecting"
     case .releasing: stateSuffix = ", releasing"
     case .disconnected: stateSuffix = ""
     }

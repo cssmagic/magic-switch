@@ -37,10 +37,10 @@ final class IncomingConnection {
   // MARK: - Constants
 
   /// Cuts off slow-talkers. Reset on every successful frame. Held above the
-  /// peer's worst-case handoff connect time (its pair watchdog is 60s) because
-  /// a `CONNECT_ALL`/`CONNECT_ONE` receiver only acks after pairing finishes —
-  /// no frames are exchanged meanwhile — so a tighter idle cap would kill the
-  /// connection before it could reply. Must stay >= `NetworkDeviceStore`'s
+  /// peer's synchronous Bluetooth disconnect/connect time because handoff
+  /// receivers only ack after the live operation finishes. No frames are
+  /// exchanged meanwhile, so a tighter cap could kill the connection before
+  /// it replies. Must stay >= `NetworkDeviceStore`'s
   /// `handoffBodyTimeout` (the sender's matching wait).
   private static let idleTimeout: TimeInterval = 75
   /// Hard cap on a single connection regardless of idle activity. Without it,
@@ -230,8 +230,8 @@ final class IncomingConnection {
         }
         var remaining = peripherals.count
         var allSucceeded = true
-        peripherals.forEach { peripheral in
-          store.connectPeripheralFromPeer(peripheral) { success in
+        for peripheral in peripherals {
+          store.connectPeripheral(peripheral) { success in
             self.queue.async {
               allSucceeded = allSucceeded && success
               remaining -= 1
@@ -247,15 +247,30 @@ final class IncomingConnection {
       }
     case .unregisterAll:
       let store = bluetoothStore
-      DispatchQueue.main.async {
+      lastReceivedCommand = nil
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
         NotificationCenter.default.post(name: .magicSwitchReceivedUnregisterAll, object: nil)
-        store.peripherals.forEach { peripheral in
-          store.unregisterFromPC(peripheral)
+        let peripherals = store.peripherals
+        guard !peripherals.isEmpty else {
+          self.queue.async { self.sendString(DeviceCommand.operationSuccess.rawValue) }
+          return
+        }
+        var remaining = peripherals.count
+        var allSucceeded = true
+        for peripheral in peripherals {
+          store.releasePeripheral(peripheral, reclaimOnLeaseExpiry: true) { success in
+            allSucceeded = allSucceeded && success
+            remaining -= 1
+            guard remaining == 0 else { return }
+            self.queue.async {
+              self.sendString(
+                (allSucceeded ? DeviceCommand.operationSuccess : DeviceCommand.operationFailed)
+                  .rawValue)
+            }
+          }
         }
       }
-      // See connectAll above for the best-effort-ack rationale.
-      sendString(DeviceCommand.operationSuccess.rawValue)
-      lastReceivedCommand = nil
     case .ping:
       // Pure no-op preflight; just acknowledge.
       sendString(DeviceCommand.operationSuccess.rawValue)
@@ -314,17 +329,23 @@ final class IncomingConnection {
       }
       let store = bluetoothStore
       let address = message
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
         // Peripheral is leaving this Mac for the peer — flash the sending arrow.
         NotificationCenter.default.post(name: .magicSwitchPeripheralOutgoing, object: nil)
-        if let peripheral = store.peripherals.first(where: { $0.id == address }) {
-          store.unregisterFromPC(peripheral)
+        guard let peripheral = store.peripherals.first(where: { $0.id == address }) else {
+          // Not registered here means this app cannot be holding it on behalf
+          // of the peer, so the requested release is already satisfied.
+          self.queue.async { self.sendString(DeviceCommand.operationSuccess.rawValue) }
+          return
+        }
+        store.releasePeripheral(peripheral, reclaimOnLeaseExpiry: true) { success in
+          self.queue.async {
+            self.sendString(
+              (success ? DeviceCommand.operationSuccess : DeviceCommand.operationFailed).rawValue)
+          }
         }
       }
-      // Reply OP_SUCCESS even if the peripheral isn't in our registered
-      // list — from the peer's perspective the goal ("you don't hold it
-      // anymore") is satisfied either way.
-      sendString(DeviceCommand.operationSuccess.rawValue)
     case .connectOne:
       guard Self.isValidMACAddress(message) else {
         print("connectOne: invalid MAC address: \(message)")
@@ -343,7 +364,7 @@ final class IncomingConnection {
           }
           return
         }
-        store.connectPeripheralFromPeer(peripheral) { success in
+        store.connectPeripheral(peripheral) { success in
           self.queue.async {
             self.sendString(
               (success ? DeviceCommand.operationSuccess : DeviceCommand.operationFailed).rawValue)
@@ -373,8 +394,8 @@ final class IncomingConnection {
       // ones we have registered — a proactive handoff, so they arrive here at
       // once instead of via reactive adoption. Validate every entry before
       // touching the store with peer-supplied input, and cap the list. Ack on
-      // receipt (we don't make the sleeping peer wait out pairing) and run the
-      // grab async; `connectPeripheralFromPeer` no-ops on anything we already
+      // receipt (we don't make the sleeping peer wait out connection attempts)
+      // and run the grab async; `connectPeripheral` adopts anything we already
       // hold, and the watcher (`armReconnectForTakeover`) covers a device
       // that's briefly stuck and needs a power-cycle.
       let macs = message.split(separator: ",").map(String.init)
@@ -390,7 +411,7 @@ final class IncomingConnection {
         // One arrow flash for the batch (receiving direction).
         NotificationCenter.default.post(name: .magicSwitchPeripheralIncoming, object: nil)
         for peripheral in toTake {
-          store.connectPeripheralFromPeer(peripheral)
+          store.connectPeripheral(peripheral)
           store.armReconnectForTakeover(peripheral.id)
         }
       }

@@ -61,14 +61,10 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
   /// dropped packet clears on the retry rather than arming adoption.
   private static let fastRecheckDelay: TimeInterval = 3
 
-  /// Body-read timeout for the two commands whose receiver only acks after it
-  /// has actually finished (re-)pairing — `CONNECT_ALL` and `CONNECT_ONE` —
-  /// rather than acking on receipt. It must exceed the receiver's worst-case
-  /// connect time (its pair watchdog, `pairTimeout`, is 60s) so the sender
-  /// waits for the real result instead of giving up early; and the receiver's
-  /// `IncomingConnection.idleTimeout` must stay >= this so it doesn't idle-kill
-  /// the connection before sending that ack. Every other command acks
-  /// immediately and uses `OutgoingConnection`'s 5s default.
+  /// Body-read timeout for handoff commands whose receiver acknowledges only
+  /// after a synchronous Bluetooth disconnect/connect has actually finished.
+  /// `IncomingConnection.idleTimeout` must stay >= this so the receiver is not
+  /// torn down before sending that result. Other commands use the 5s default.
   private static let handoffBodyTimeout: TimeInterval = 75
 
   /// Consecutive failed `.ping` polls per device id (runtime only). Drives
@@ -169,7 +165,7 @@ final class NetworkDeviceStore: ObservableObject, NetworkDeviceManageable {
     // computer name, mDNS gives one of them a "Name (2)" suffix, and if that
     // suffix is the name registered for the peer, this Mac starts sending its
     // own switch commands to itself — releasing every peripheral and
-    // re-pairing it locally (a multi-second loss of keyboard and trackpad)
+    // reconnecting it locally (a multi-second loss of keyboard and trackpad)
     // while the real peer gets nothing. Self is recognised by address, the
     // same way `availableNetworkDevices` does it.
     guard !Self.localAddresses().contains(Self.normalizeHost(device.host)) else { return }
@@ -867,17 +863,22 @@ enum ManualAddError: Error {
 
 /// Represents different types of device commands
 enum DeviceCommand: String, Codable {
+  /// Disconnect every registered peripheral without changing Bluetooth
+  /// pairing records; ack only after all live disconnect results are known.
   case unregisterAll = "UNREGISTER_ALL"
+  /// Open each registered peripheral's existing paired connection; ack only
+  /// after all live connection results are known.
   case connectAll = "CONNECT_ALL"
   case operationSuccess = "OP_SUCCESS"
   case operationFailed = "OP_FAILED"
   case notification = "NOTIFICATION"
   case syncPeripherals = "SYNC_PERIPHERALS"
   /// Two-frame: opcode then a single peripheral's MAC address. The peer
-  /// releases just that peripheral (used by per-peripheral switch flows).
+  /// disconnects just that peripheral without changing its pairing (used by
+  /// per-peripheral switch flows).
   case unregisterOne = "UNREGISTER_ONE"
   /// Two-frame: opcode then a single peripheral's MAC address. The peer
-  /// connects just that peripheral.
+  /// opens that peripheral's existing paired connection.
   case connectOne = "CONNECT_ONE"
   /// Two-frame: opcode then a single peripheral's MAC address. The peer acks
   /// `OP_SUCCESS` if it currently holds (has a live Bluetooth connection to)
@@ -893,8 +894,8 @@ enum DeviceCommand: String, Codable {
   case ping = "PING"
   /// Two-frame: opcode then a comma-separated list of MAC addresses the
   /// *sender* just released as it goes to sleep. The receiver acks on receipt
-  /// (like `UNREGISTER_ALL`, not after pairing — the sleeping sender can't wait
-  /// that long) and then takes those peripherals. A proactive handoff, so a
+  /// (unlike normal handoff commands, not after connection attempts — the
+  /// sleeping sender cannot wait that long) and then takes those peripherals. A proactive handoff, so a
   /// peripheral lands on the awake Mac immediately instead of waiting for the
   /// sleeping peer to be detected gone. Best-effort: the sender has already
   /// released locally, so a dropped push just falls back to reactive adoption.
@@ -983,7 +984,8 @@ extension NetworkDeviceStore {
       return
     }
 
-    let bodyTimeout: TimeInterval = command == .connectAll ? Self.handoffBodyTimeout : 5
+    let bodyTimeout: TimeInterval =
+      command == .connectAll || command == .unregisterAll ? Self.handoffBodyTimeout : 5
     let outgoing = OutgoingConnection(
       host: device.host,
       port: UInt16(device.port),
@@ -1345,7 +1347,8 @@ extension NetworkDeviceStore {
       completion(.failure(.notPaired))
       return
     }
-    let bodyTimeout: TimeInterval = command == .connectOne ? Self.handoffBodyTimeout : 5
+    let bodyTimeout: TimeInterval =
+      command == .connectOne || command == .unregisterOne ? Self.handoffBodyTimeout : 5
     let outgoing = OutgoingConnection(
       host: device.host, port: UInt16(device.port),
       countsTowardRateLimit: countsTowardRateLimit,
