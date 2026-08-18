@@ -29,7 +29,7 @@ struct SettingsView: View {
         .tabItem {
           Label(TabItem.devices.text, systemImage: TabItem.devices.image)
             .help(
-              "Pick which paired Bluetooth peripherals Magic Switch should manage. Pair them in System Settings → Bluetooth first; this tab just selects from those."
+              "Pick which paired Bluetooth peripherals Magic Switch should manage. Pair them in System Settings → Bluetooth first; Magic Switch never creates or deletes those pairings."
             )
         }
         .tag(0)

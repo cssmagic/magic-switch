@@ -44,7 +44,7 @@ struct OtherSettingsView: View {
       Section(header: Text("Peripheral handling")) {
         Toggle("Release peripherals when this Mac sleeps", isOn: $releaseOnSleep)
           .help(
-            "When this Mac sleeps, hand its Magic peripherals back so your other Mac can take them. A sleeping Mac can't be asked to release them over the network, so Magic Switch releases them just before sleeping. Turn off to keep a peripheral bonded to this Mac while it sleeps."
+            "When this Mac sleeps, disconnect its Magic peripherals so your other Mac can take them. Magic Switch never removes their Bluetooth pairings. Turn this off to keep the active connection on this Mac while it sleeps."
           )
         Toggle("Reconnect peripherals if they drop", isOn: $autoReconnect)
           .help(

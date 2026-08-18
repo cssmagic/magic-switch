@@ -90,9 +90,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// Matches the previous fixed-window revert, so the degenerate case
   /// where nothing ever transitions behaves exactly as before.
   private static let transferSettleGrace: TimeInterval = 5
-  /// Backstop for a held transfer whose rows never settle — a `.releasing`
-  /// row has no watchdog of its own, unlike `.connecting`'s 60s pair
-  /// watchdog. Sized to outlast that pair watchdog with slack.
+  /// Backstop for a held transfer whose rows never settle, including a slow
+  /// synchronous Bluetooth connection or a lost network completion.
   private static let transferHardCap: TimeInterval = 90
 
   // MARK: - Lifecycle Methods
@@ -329,7 +328,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // revealed over full-screen Spaces and never activates the app. Its single
     // item hosts an AppKit `DropdownContentView` whose controls consume the
     // mouse-up, so clicks don't dismiss it — the dropdown stays open while a
-    // peripheral pairs. (SwiftUI controls don't track inside a menu.)
+    // peripheral connects. (SwiftUI controls don't track inside a menu.)
     statusItem.menu = makeDropdownMenu()
     refreshStatusBarIcon()
   }
@@ -471,10 +470,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// is still `connecting`/`releasing` and reverts once the last one
   /// settles. Used by every path that lacks a single "all peripherals
   /// settled" callback — the store's per-peripheral states *are* that
-  /// signal (pairing callbacks, the 60s pair watchdog, and the handoff
-  /// completion arms all resolve them), which the old fixed 5s window
-  /// ignored, reverting the icon while a transfer had seconds-to-a-minute
-  /// left to run.
+  /// signal (connection and handoff completion arms all resolve them), which
+  /// the old fixed 5s window ignored, reverting the icon while a transfer was
+  /// still running.
   private func beginTransferHold(_ state: TransferState) {
     transferState = state
     transferLatchedAt = Date()
@@ -601,7 +599,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     }
     switch command.resolvePeripherals(in: bluetoothStore) {
     case .success(let peripherals):
-      peripherals.forEach { bluetoothStore.switchPeripheral($0, direction: command.direction) }
+      for peripheral in peripherals {
+        bluetoothStore.switchPeripheral(peripheral, direction: command.direction)
+      }
     case .failure(let error):
       NotificationManager.showNotification(
         title: "Invalid Switch Command", body: error.message, identifier: "url-command-invalid")
@@ -637,7 +637,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// `performFullSetCommand`). `checkHealth` confirms the peer's TCP port is
   /// open before we touch any local Bluetooth state.
   private func performSwitch(with device: NetworkDevice, direction: SwitchDirection = .toggle) {
-    // Don't start a full-set switch while a per-peripheral pair/handoff is in
+    // Don't start a full-set switch while a per-peripheral connection/handoff is in
     // flight: it would issue a re-entrant connect/unregister on a peripheral
     // that's already transitioning. The dropdown disables the Mac row for this
     // too; this guard closes the brief click-race before the row re-renders.
@@ -681,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
       // port is open, but not that the peer's app will accept commands —
       // if the peer's app isn't actually running or the secure channel
       // can't be established, we'd otherwise disconnect locally and then
-      // fail to hand peripherals over, leaving them paired nowhere.
+      // fail to hand peripherals over, leaving them connected to neither Mac.
       beginTransfer(.sending)
       networkStore.executeCommand(.ping, on: device) { [weak self] preflight in
         // Fires on the outgoing-connection queue; hop to main before
@@ -723,8 +723,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// immediately; no preflight is needed because `executeCommand(.unregisterAll)`
   /// *is* the preflight — if it fails, nothing has changed locally yet.
   /// Shared by the menu's full-set switch and the display trigger. Safe when
-  /// some peripherals are already on this Mac: the peer only releases what it
-  /// holds, and `connectPeripheralFromPeer` adopts an already-live connection.
+  /// some peripherals are already on this Mac: the peer only disconnects what
+  /// it holds, and `connectPeripheral` adopts an already-live connection.
   private func takeAllPeripherals(from device: NetworkDevice) {
     beginTransfer(.receiving)
     networkStore.executeCommand(.unregisterAll, on: device) { [weak self] result in
@@ -735,7 +735,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         switch result {
         case .success, .failure(.connectionFailed), .failure(.connectTimeout):
           // The transfer is nowhere near done: the peer has only *released*
-          // (or vanished); the local re-pairing below is the long half.
+          // (or vanished); the local connection work below is the long half.
           // Convert the explicit "receiving" into a held one so the icon
           // stays up until the last `.connecting` row settles, instead of
           // reverting here — before the first local connect even starts.
@@ -747,12 +747,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
           // has already released its Bluetooth devices. Both ways the
           // peripherals are free: grab them locally instead of stranding the
           // user with an error they can't act on, and arm the auto-reconnect
-          // watcher as the retry safety net for any device stuck in the
-          // bonded-but-not-connected state that needs a power-cycle. Mirrors
+          // watcher as the retry safety net for any device that still refuses
+          // its already-paired connection and needs a power-cycle. Mirrors
           // `takePeripheralFromPeer`'s success + unreachable arms, at full-set
           // scope.
-          self.bluetoothStore.peripherals.forEach { peripheral in
-            self.bluetoothStore.connectPeripheralFromPeer(peripheral)
+          for peripheral in self.bluetoothStore.peripherals {
+            self.bluetoothStore.connectPeripheral(peripheral)
             self.bluetoothStore.armReconnectForTakeover(peripheral.id)
           }
         case .failure(let err):
@@ -763,7 +763,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
           // which reclaims each one only once the peer confirms it isn't
           // holding it — and recovers the case where the peer released but
           // the ack was lost.
-          self.bluetoothStore.peripherals.forEach { peripheral in
+          for peripheral in self.bluetoothStore.peripherals {
             self.bluetoothStore.armReconnectForTakeover(peripheral.id)
           }
           NotificationManager.showNotification(
@@ -841,7 +841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         // No trusted peer to ask. Connect whatever answers and arm the
         // watcher for the rest, so a stuck device is caught the moment the
         // user power-cycles it.
-        self.bluetoothStore.peripherals.forEach { peripheral in
+        for peripheral in self.bluetoothStore.peripherals {
           self.bluetoothStore.connectPeripheral(peripheral)
           self.bluetoothStore.armReconnectForTakeover(peripheral.id)
         }
@@ -855,7 +855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// locally rather than leave them stranded.
   private func performHandoffToPeer(device: NetworkDevice) {
     // Paint every row "Releasing…" before the releases start — the mirror of
-    // the peer's "Pairing…", and what keeps `isAnyPeripheralTransitioning`
+    // the peer's "Connecting…", and what keeps `isAnyPeripheralTransitioning`
     // true for the whole release window now that the IOBluetooth work runs
     // asynchronously on the store's Bluetooth queue. Without it, a second
     // hotkey/trigger/click during the releases would pass the re-entrancy
@@ -864,85 +864,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     // terminal branch below resolves it.
     bluetoothStore.beginFullSetRelease()
     let releases = DispatchGroup()
-    bluetoothStore.peripherals.forEach { peripheral in
+    var allReleased = true
+    for peripheral in bluetoothStore.peripherals {
       releases.enter()
-      bluetoothStore.unregisterFromPC(peripheral) { releases.leave() }
+      bluetoothStore.releasePeripheral(peripheral) { success in
+        allReleased = allReleased && success
+        releases.leave()
+      }
     }
     releases.notify(queue: .main) { [weak self] in
-      self?.continueHandoffToPeer(device: device)
+      guard let self = self else { return }
+      guard allReleased else {
+        // Some devices may already have disconnected before another release
+        // failed. Reconnect the complete set locally and never issue
+        // CONNECT_ALL to the peer after a partial local release.
+        for peripheral in self.bluetoothStore.peripherals {
+          self.bluetoothStore.connectPeripheral(peripheral)
+        }
+        self.endTransfer()
+        NotificationManager.showNotification(
+          title: "Switch Failed",
+          body:
+            "At least one peripheral couldn't disconnect from this Mac. The handoff was cancelled and the local connections are being restored.",
+          identifier: "switch-disconnect-local-failed")
+        return
+      }
+      self.continueHandoffToPeer(device: device)
     }
   }
 
   /// Rest of the full-set handoff, entered once every local release landed.
   private func continueHandoffToPeer(device: NetworkDevice) {
-    waitForDisconnection { [weak self] allDisconnected in
-      guard let self = self else { return }
-      guard allDisconnected else {
-        self.bluetoothStore.finishFullSetRelease(success: false)
-        self.endTransfer()
-        NotificationManager.showNotification(
-          title: "Switch Failed",
-          body: "Couldn't disconnect Bluetooth peripherals from this Mac.",
-          identifier: "switch-disconnect-local-failed"
-        )
-        return
-      }
-      self.networkStore.executeCommand(.connectAll, on: device) { [weak self] result in
-        // The completion fires on the outgoing-connection queue (see
-        // `takeAllPeripherals`); hop to main before `endTransfer` touches
-        // the status-bar button and the transfer/latch state the settle
-        // observer reads on main.
-        DispatchQueue.main.async {
-          guard let self = self else { return }
-          if case .failure(let err) = result {
-            // Rollback: peer didn't take the peripherals, so re-pair them
-            // locally. Without this the user is left with peripherals paired
-            // nowhere. `connectPeripheral` flips each row to `.connecting`,
-            // which clears the "Releasing…" state on its own.
-            self.bluetoothStore.peripherals.forEach { peripheral in
-              self.bluetoothStore.connectPeripheral(peripheral)
-            }
-            self.endTransfer()
-            NotificationManager.showNotification(
-              title: "Switch Failed",
-              body: "\(err.userMessage) Peripherals reconnected to this Mac.",
-              identifier: "switch-connect-failed"
-            )
-          } else {
-            self.bluetoothStore.finishFullSetRelease(success: true)
-            self.endTransfer()
+    networkStore.executeCommand(.connectAll, on: device) { [weak self] result in
+      // The completion fires on the outgoing-connection queue (see
+      // `takeAllPeripherals`); hop to main before `endTransfer` touches
+      // the status-bar button and the transfer/latch state the settle
+      // observer reads on main.
+      DispatchQueue.main.async {
+        guard let self = self else { return }
+        if case .failure(let err) = result {
+          // Rollback uses the same public, non-destructive connection path.
+          // Starting each local connection clears its release lease first.
+          for peripheral in self.bluetoothStore.peripherals {
+            self.bluetoothStore.connectPeripheral(peripheral)
           }
-        }
-      }
-    }
-  }
-
-  /// Waits for all devices to disconnect with a timeout
-  /// - Parameter completion: Called with true if all devices disconnected, false if timeout occurred
-  private func waitForDisconnection(completion: @escaping (Bool) -> Void) {
-    var attempts = 0
-    let maxAttempts = 5
-
-    func check() {
-      attempts += 1
-      bluetoothStore.checkActualConnectionStatusAsync { status in
-        if status == .allDisconnected {
-          completion(true)
-        } else if attempts < maxAttempts {
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            check()
-          }
+          self.endTransfer()
+          NotificationManager.showNotification(
+            title: "Switch Failed",
+            body: "\(err.userMessage) Peripherals are reconnecting to this Mac.",
+            identifier: "switch-connect-failed"
+          )
         } else {
-          completion(false)
+          self.bluetoothStore.finishFullSetRelease(success: true)
+          self.endTransfer()
         }
       }
     }
-
-    // First check fires immediately — this runs from the `unregisterFromPC`
-    // completions, after the disconnects were issued on the Bluetooth queue,
-    // so the device is often already disconnected. Falls through to the
-    // polled retry loop if not.
-    check()
   }
 
   // MARK: - Settings Management
