@@ -70,6 +70,15 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     static let adoptionMaxConnectAttempts = 3
   }
 
+  /// Result of asking IOBluetooth to close an existing baseband connection.
+  /// `closeConnection()` is synchronous and its success return is authoritative;
+  /// an immediately-following `isConnected()` snapshot can still be stale or
+  /// reflect a rapid macOS reconnect, so it must never overturn that result.
+  private enum CloseConnectionOutcome {
+    case released
+    case failed(IOReturn)
+  }
+
   // MARK: - Dependencies
 
   private let bluetoothQueue = DispatchQueue(label: Constants.queueLabel, qos: .userInitiated)
@@ -411,10 +420,10 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
         else { continue }
         connectedIDs.append(peripheral.id)
         guard shouldRelease else { continue }
-        let result = device.closeConnection()
-        if !device.isConnected() {
+        switch closeConnectionIfNeeded(device) {
+        case .released:
           releasedIDs.append(peripheral.id)
-        } else {
+        case .failed(let result):
           print("Before sleep: failed to disconnect \(peripheral.name): \(result)")
         }
       }
@@ -616,47 +625,54 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
       print("Bluetooth is off; \(peripheral.name) is already disconnected")
       markDisconnectedAfterRelease(peripheral.id)
       finishReleasePeripheral(
-        peripheral, success: true, connectedAfterFailure: false,
-        detail: "", completion: completion)
+        peripheral, success: true, detail: "", completion: completion)
       return
     }
     guard let device = IOBluetoothDevice(addressString: peripheral.id) else {
       print("\(peripheral.name) is absent from the Bluetooth stack and already disconnected")
       markDisconnectedAfterRelease(peripheral.id)
       finishReleasePeripheral(
-        peripheral, success: true, connectedAfterFailure: false,
-        detail: "", completion: completion)
+        peripheral, success: true, detail: "", completion: completion)
       return
     }
 
-    var result = kIOReturnSuccess
-    if device.isConnected() {
-      result = device.closeConnection()
-    }
-    let success = !device.isConnected()
-    if success {
+    switch closeConnectionIfNeeded(device) {
+    case .released:
       print("Disconnected \(peripheral.name) without changing its pairing")
       markDisconnectedAfterRelease(peripheral.id)
-    } else {
+      finishReleasePeripheral(
+        peripheral, success: true, detail: "", completion: completion)
+    case .failed(let result):
       print("Failed to disconnect \(peripheral.name): \(result)")
+      finishReleasePeripheral(
+        peripheral, success: false, detail: "closeConnection returned \(result)",
+        completion: completion)
     }
-    finishReleasePeripheral(
-      peripheral, success: success, connectedAfterFailure: device.isConnected(),
-      detail: "closeConnection returned \(result)", completion: completion)
+  }
+
+  /// Closes `device` without modifying its pairing record. A successful
+  /// IOBluetooth return is final. When the command reports an error, a live
+  /// state check may still prove that the connection disappeared concurrently,
+  /// which also satisfies the release request.
+  private func closeConnectionIfNeeded(_ device: IOBluetoothDevice) -> CloseConnectionOutcome {
+    guard device.isConnected() else { return .released }
+    let result = device.closeConnection()
+    if result == kIOReturnSuccess || !device.isConnected() {
+      return .released
+    }
+    return .failed(result)
   }
 
   private func finishReleasePeripheral(
     _ peripheral: BluetoothPeripheral,
     success: Bool,
-    connectedAfterFailure: Bool,
     detail: String,
     completion: ((Bool) -> Void)?
   ) {
     DispatchQueue.main.async {
       if !success {
         self.clearReleaseLease(peripheral.id)
-        self.setConnectionState(
-          connectedAfterFailure ? .connected : .disconnected, for: peripheral.id)
+        self.setConnectionState(.connected, for: peripheral.id)
         self.setPeripheralError("Couldn't release.", for: peripheral.id)
         NotificationManager.showNotification(
           title: "Couldn't Release Peripheral",
@@ -1458,16 +1474,13 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
     guard hasActiveReleaseLease(address) else { return }
     bluetoothQueue.async { [weak self] in
       guard let self = self else { return }
-      var result = kIOReturnSuccess
-      if device.isConnected() {
-        result = device.closeConnection()
-      }
-      let released = !device.isConnected()
+      let outcome = self.closeConnectionIfNeeded(device)
       DispatchQueue.main.async {
         guard self.hasActiveReleaseLease(address) else { return }
-        if released {
+        switch outcome {
+        case .released:
           self.markDisconnectedAfterRelease(address)
-        } else {
+        case .failed(let result):
           print("Release lease couldn't disconnect \(address): \(result)")
           self.setPeripheralError("Couldn't keep released.", for: address)
           NotificationManager.showNotification(
@@ -1611,8 +1624,8 @@ final class BluetoothPeripheralStore: NSObject, ObservableObject, BluetoothPerip
   /// failure; an adoption — no prior claim — takes it only once the peer is
   /// provably absent: unreachable at the connect layer for
   /// `adoptionRequiredAbsentStreak` consecutive probes. A peer that answers
-  /// at all — an explicit "not holding" (`.bodyFailed`) included — outranks
-  /// us, so stand down and leave the move to its reclaim or to the user.
+  /// at all — an explicit "not holding" (`.remoteOperationFailed`) included —
+  /// outranks us, so stand down and leave the move to its reclaim or to the user.
   /// Connection attempts are capped: repeated failures usually mean the
   /// device is busy with a peer we cannot reach.
   private func continueAdoption(of peripheral: BluetoothPeripheral, after failure: OutgoingFailure)
