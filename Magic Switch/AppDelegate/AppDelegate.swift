@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   private let networkStore = NetworkDeviceStore.shared
   private let bluetoothStore = BluetoothPeripheralStore.shared
   /// Fires the automatic full-set take when a display the user marked as a
-  /// switch trigger (Settings → Other) connects to this Mac.
+  /// switch trigger (Settings → Other) connects, or is present after wake.
   private let displayMonitor = DisplayMonitor.shared
 
   // MARK: - UI Components
@@ -33,6 +33,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// wakes never post `didWake`, so this stays set across overnight
   /// maintenance wakes.
   private var isSystemSleeping = false
+  /// Invalidates external live-status checks that span a sleep transition.
+  private var sleepGeneration = UUID()
   /// Radio state captured at `willSleep`, gating the wake recheck.
   private var bluetoothWasOnBeforeSleep = false
   private var wakeBluetoothRecheck: DispatchWorkItem?
@@ -40,6 +42,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// How long after a real wake to wait before deciding Bluetooth is
   /// genuinely off — the radio takes a moment to power back up.
   private static let bluetoothWakeGrace: TimeInterval = 3
+  private enum WakeDisplayTakeState {
+    case waiting
+    case checking
+    case handled
+  }
+  private struct WakeDisplayTake {
+    let id = UUID()
+    let deadline: Date
+    var state: WakeDisplayTakeState = .waiting
+  }
+  /// Retain handled sessions until their deadline to coalesce display churn
+  /// even after the retry timer has stopped. All wake-take state is main-only.
+  private var wakeDisplayTake: WakeDisplayTake?
+  private var wakeDisplayTakeTimer: DispatchSourceTimer?
+  private static let wakeDisplayTakeDelay: TimeInterval = 5
+  private static let wakeDisplayTakeWindow: TimeInterval = 30
+  private static let wakeDisplayTakeRetry: TimeInterval = 1
+  private enum TakeAttemptResult {
+    case deferred
+    case noOp
+    case started
+  }
+  /// Reserve the asynchronous live-status check, before any peripheral has
+  /// entered a transitional state, so external claims cannot overlap it.
+  private var isExternalTakeChecking = false
   /// Cached Settings window controller. We host `SettingsView` in a manual
   /// `NSWindow` rather than going through SwiftUI's `Settings` scene because
   /// the scene's `showSettingsWindow:` action silently fails to produce a
@@ -174,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   }
 
   deinit {
+    wakeDisplayTakeTimer?.cancel()
     if let token = windowCloseObserver {
       NotificationCenter.default.removeObserver(token)
     }
@@ -277,15 +305,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
     ) { [weak self] _ in
       guard let self else { return }
       self.isSystemSleeping = true
+      self.sleepGeneration = UUID()
       self.bluetoothWasOnBeforeSleep = BluetoothManager.shared.state == .poweredOn
       self.wakeBluetoothRecheck?.cancel()
       self.wakeBluetoothRecheck = nil
+      if let session = self.wakeDisplayTake, session.state != .handled {
+        print("Wake display take: cancelled for sleep")
+      }
+      self.wakeDisplayTakeTimer?.cancel()
+      self.wakeDisplayTakeTimer = nil
+      self.wakeDisplayTake = nil
     }
     wakeObserver = center.addObserver(
       forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
     ) { [weak self] _ in
-      guard let self else { return }
+      guard let self, self.isSystemSleeping else { return }
       self.isSystemSleeping = false
+      self.scheduleWakeDisplayTake()
       // Only when sleep began with the radio on: the recheck exists for a
       // radio that fails to come back, not to re-nag on every wake a user
       // who keeps Bluetooth off.
@@ -293,6 +329,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
         self.scheduleWakeBluetoothRecheck()
       }
     }
+  }
+
+  /// One bounded attempt per real sleep/wake cycle. Delayed screen detection,
+  /// Bluetooth recovery and ongoing reconnects all share the same deadline.
+  private func scheduleWakeDisplayTake() {
+    guard !displayMonitor.triggerDisplays.isEmpty else { return }
+    let session = WakeDisplayTake(
+      deadline: Date().addingTimeInterval(Self.wakeDisplayTakeWindow))
+    wakeDisplayTake = session
+    print("Wake display take: waiting up to \(Self.wakeDisplayTakeWindow) seconds")
+    let timer = DispatchSource.makeTimerSource(queue: .main)
+    timer.schedule(
+      deadline: .now() + Self.wakeDisplayTakeDelay, repeating: Self.wakeDisplayTakeRetry)
+    timer.setEventHandler { [weak self] in self?.checkWakeDisplayTake(id: session.id) }
+    timer.resume()
+    wakeDisplayTakeTimer = timer
+  }
+
+  private func finishWakeDisplayTake(id: UUID, reason: String) {
+    guard wakeDisplayTake?.id == id else { return }
+    wakeDisplayTake?.state = .handled
+    wakeDisplayTakeTimer?.cancel()
+    wakeDisplayTakeTimer = nil
+    print("Wake display take: \(reason)")
+  }
+
+  private func checkWakeDisplayTake(id: UUID) {
+    guard let session = wakeDisplayTake, session.id == id else { return }
+    guard !isSystemSleeping, Date() < session.deadline else {
+      finishWakeDisplayTake(id: id, reason: "expired or system sleeping")
+      return
+    }
+    guard !displayMonitor.triggerDisplays.isEmpty else {
+      finishWakeDisplayTake(id: id, reason: "cancelled; no trigger displays configured")
+      return
+    }
+    guard !bluetoothStore.peripherals.isEmpty else {
+      finishWakeDisplayTake(id: id, reason: "no registered peripherals")
+      return
+    }
+    guard session.state == .waiting else { return }
+    wakeDisplayTake?.state = .checking
+    var displayNames: [String] = []
+    takeAllPeripheralsIfAway(
+      canProceed: { [weak self] in
+        guard let self,
+          let current = self.wakeDisplayTake, current.id == id, current.state == .checking,
+          !self.isSystemSleeping, Date() < current.deadline,
+          BluetoothManager.shared.state == .poweredOn,
+          let displays = self.displayMonitor.currentTriggerDisplays(), !displays.isEmpty
+        else { return false }
+        displayNames = displays.map { $0.name }
+        return true
+      },
+      completion: { [weak self] result in
+        guard let self, self.wakeDisplayTake?.id == id,
+          self.wakeDisplayTake?.state == .checking
+        else { return }
+        switch result {
+        case .deferred:
+          self.wakeDisplayTake?.state = .waiting
+        case .noOp:
+          self.finishWakeDisplayTake(id: id, reason: "peripherals already here or none registered")
+        case .started:
+          break  // onTake consumes the session before issuing any release request.
+        }
+      },
+      onTake: { [weak self] in
+        guard let self else { return }
+        self.finishWakeDisplayTake(id: id, reason: "taking peripherals; displays: \(displayNames)")
+        NotificationManager.showNotification(
+          title: "Mac Woke Up",
+          body:
+            "This Mac woke up with \(displayNames.joined(separator: ", ")) connected — switching your peripherals to this Mac.",
+          identifier: "display-trigger-switch"
+        )
+      }
+    )
   }
 
   /// If Bluetooth fails to come back after a real wake, the state was already
@@ -799,14 +913,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// A trigger display just connected (runs on main). Announce it, then take
   /// the full set through the shared external-claim engine below.
   private func handleTriggerDisplaysConnected(_ names: [String]) {
-    takeAllPeripheralsIfAway {
-      NotificationManager.showNotification(
-        title: "Display Connected",
-        body:
-          "\(names.joined(separator: ", ")) connected — switching your peripherals to this Mac.",
-        identifier: "display-trigger-switch"
-      )
+    guard !isSystemSleeping else { return }
+    if let session = wakeDisplayTake, Date() < session.deadline {
+      // The wake timer handles new connections too. Keep suppressing edges
+      // after it finishes so dock renegotiation cannot cause a second take.
+      return
     }
+    takeAllPeripheralsIfAway(
+      onTake: {
+        NotificationManager.showNotification(
+          title: "Display Connected",
+          body:
+            "\(names.joined(separator: ", ")) connected — switching your peripherals to this Mac.",
+          identifier: "display-trigger-switch"
+        )
+      }
+    )
   }
 
   /// Take the full set onto this Mac in response to an automatic or external
@@ -818,16 +940,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
   /// clicked row to target: use the trusted peer, or fall back to a plain
   /// local grab when none is registered — the trigger is a claim on the
   /// peripherals either way. `onTake` fires once a take is actually going to
-  /// happen, so the display trigger can announce itself.
-  private func takeAllPeripheralsIfAway(onTake: @escaping () -> Void = {}) {
-    guard !bluetoothStore.peripherals.isEmpty,
+  /// happen, so the display trigger can announce itself. `canProceed` is
+  /// evaluated both before and after the live query; wake claims use it to
+  /// enforce their session deadline and require a connected trigger display.
+  private func takeAllPeripheralsIfAway(
+    canProceed: @escaping () -> Bool = { true },
+    completion: @escaping (TakeAttemptResult) -> Void = { _ in },
+    onTake: @escaping () -> Void = {}
+  ) {
+    guard !isSystemSleeping, canProceed() else {
+      completion(.deferred)
+      return
+    }
+    guard !bluetoothStore.peripherals.isEmpty else {
+      completion(.noOp)
+      return
+    }
+    guard !isExternalTakeChecking, transferState == .idle,
       !bluetoothStore.isAnyPeripheralTransitioning,
       // The same states the status-bar icon treats as healthy (`.unknown`
       // just means CoreBluetooth hasn't reported yet, e.g. right at launch).
       BluetoothManager.shared.state == .poweredOn || BluetoothManager.shared.state == .unknown
-    else { return }
+    else {
+      completion(.deferred)
+      return
+    }
+    let peripheralIDs = Set(bluetoothStore.peripherals.map { $0.id })
+    let sleepGeneration = self.sleepGeneration
+    isExternalTakeChecking = true
     bluetoothStore.checkActualConnectionStatusAsync { [weak self] status in
-      guard let self = self, status != .allConnected else { return }
+      guard let self else {
+        completion(.deferred)
+        return
+      }
+      defer { self.isExternalTakeChecking = false }
+      // The live query runs off-main. Revalidate intent and readiness after
+      // it returns; a sleep, disconnect, new transfer or list edit can race it.
+      guard !self.isSystemSleeping, self.sleepGeneration == sleepGeneration,
+        canProceed(), self.transferState == .idle,
+        !self.bluetoothStore.isAnyPeripheralTransitioning,
+        peripheralIDs == Set(self.bluetoothStore.peripherals.map { $0.id }),
+        BluetoothManager.shared.state == .poweredOn || BluetoothManager.shared.state == .unknown
+      else {
+        completion(.deferred)
+        return
+      }
+      guard status != .allConnected else {
+        completion(.noOp)
+        return
+      }
       onTake()
       // Same trusted-peer rule as the sleep handoff: registered and not
       // parked behind an identity mismatch. Reachability isn't pre-checked:
@@ -846,6 +1007,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
           self.bluetoothStore.armReconnectForTakeover(peripheral.id)
         }
       }
+      completion(.started)
     }
   }
 

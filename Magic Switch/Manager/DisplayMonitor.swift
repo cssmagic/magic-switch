@@ -14,7 +14,7 @@ import SwiftUI
 /// EDID serial numbers are unreliably populated — the UUID sidesteps both,
 /// and works for any display, not just Apple's.
 ///
-/// Only a genuine absent → present *edge* fires the trigger:
+/// Only a genuine absent → present *edge* fires the connection callback:
 /// - The set of displays online at launch is the baseline. A display that's
 ///   already attached when the app starts never fires — an app (re)start must
 ///   not yank peripherals from a Mac the user is actively working on.
@@ -23,10 +23,10 @@ import SwiftUI
 ///   or a wake-time renegotiation nets out to no edge.
 /// - Sleep: the present set is snapshotted at `willSleep`. For a settle
 ///   window after wake, a display in that snapshot re-enters silently —
-///   staying docked across a sleep is not a dock, and must not steal the
-///   peripherals from a peer the user switched to meanwhile. A display that
-///   was *not* present at sleep still fires normally, which is exactly the
-///   carry-the-MacBook-over, plug-in, lid-opens flow the feature exists for.
+///   staying docked across a sleep is not a new connection. AppDelegate owns
+///   the separate, once-per-wake take and reads `currentTriggerDisplays()`
+///   without generating connection callbacks. A display that was *not*
+///   present at sleep still produces a connection edge normally.
 final class DisplayMonitor: ObservableObject {
   // MARK: - Singleton
 
@@ -51,7 +51,7 @@ final class DisplayMonitor: ObservableObject {
     /// the present set silently. Wake-time renegotiation (Thunderbolt docks
     /// especially) can re-enumerate a display that never physically left,
     /// seconds after `didWake` — without this window that would read as a
-    /// fresh dock and grab the peripherals on every wake-while-docked.
+    /// fresh dock in addition to AppDelegate's once-per-wake take.
     /// Generous on purpose: it never delays a genuine trigger (a display
     /// absent at sleep is exempt); it only shields re-appearances.
     static let wakeSettleWindow: TimeInterval = 30
@@ -116,7 +116,7 @@ final class DisplayMonitor: ObservableObject {
     guard !started else { return }
     started = true
 
-    let online = Self.onlineExternalDisplays()
+    let online = Self.onlineExternalDisplays() ?? []
     presentUUIDs = Set(online.map { $0.id })
     connectedDisplays = online
     refreshTriggerNames(from: online)
@@ -189,6 +189,14 @@ final class DisplayMonitor: ObservableObject {
     reconcile()
   }
 
+  /// Read the trigger displays online right now without changing the cached
+  /// presence set or firing connection callbacks. Nil means enumeration failed,
+  /// whereas an empty array means no configured trigger is currently connected.
+  /// Main-thread only, like trigger configuration and reconciliation.
+  func currentTriggerDisplays() -> [ExternalDisplay]? {
+    Self.onlineExternalDisplays()?.filter { triggerDisplays[$0.id] != nil }
+  }
+
   private func scheduleReconcile() {
     reconcileTimer?.cancel()
     let timer = DispatchSource.makeTimerSource(queue: .main)
@@ -206,7 +214,7 @@ final class DisplayMonitor: ObservableObject {
     reconcileTimer?.cancel()
     reconcileTimer = nil
 
-    let online = Self.onlineExternalDisplays()
+    guard let online = Self.onlineExternalDisplays() else { return }
     let onlineIDs = Set(online.map { $0.id })
     let appeared = onlineIDs.subtracting(presentUUIDs)
     presentUUIDs = onlineIDs
@@ -253,12 +261,12 @@ final class DisplayMonitor: ObservableObject {
   /// (`CGGetOnlineDisplayList`) deliberately includes mirrored and sleeping
   /// displays — presence is about the cable, not what's drawn. Built-in
   /// panels are excluded: they can't be docked, so they can't be triggers.
-  private static func onlineExternalDisplays() -> [ExternalDisplay] {
+  private static func onlineExternalDisplays() -> [ExternalDisplay]? {
     var ids = [CGDirectDisplayID](repeating: 0, count: Int(Constants.maxDisplays))
     var count: UInt32 = 0
     guard CGGetOnlineDisplayList(Constants.maxDisplays, &ids, &count) == .success else {
       print("DisplayMonitor: CGGetOnlineDisplayList failed")
-      return []
+      return nil
     }
     let displays: [ExternalDisplay] = ids.prefix(Int(count)).compactMap { id in
       guard CGDisplayIsBuiltin(id) == 0 else { return nil }

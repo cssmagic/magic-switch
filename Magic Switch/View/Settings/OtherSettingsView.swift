@@ -83,9 +83,9 @@ struct OtherSettingsView: View {
         }
       } header: {
         HStack {
-          Text("Take peripherals when a display connects")
+          Text("Take peripherals on display connection or wake")
             .help(
-              "Displays connected to this Mac appear here. A display you mark acts as a docking trigger: whenever it connects to this Mac, Magic Switch switches your peripherals to this Mac automatically."
+              "Displays connected to this Mac appear here. Magic Switch automatically takes your peripherals when a marked display connects, or when this Mac wakes with one connected. After wake, checks start at 5 seconds and stop at 30 seconds, taking peripherals at most once."
             )
           Spacer()
           Button(action: { displayMonitor.refreshNow() }) {
@@ -189,7 +189,7 @@ struct OtherSettingsView: View {
     if row.isConnected {
       Toggle(row.name, isOn: triggerBinding(for: row))
         .help(
-          "When \(row.name) connects to this Mac — for example when you dock — automatically switch your Magic peripherals to this Mac, taking them from your other Mac if needed. Display ID: \(row.id)."
+          "When \(row.name) connects, or this Mac wakes with it connected, automatically switch your Magic peripherals to this Mac, taking them from your other Mac if needed. Display ID: \(row.id)."
         )
     } else {
       HStack {
@@ -200,7 +200,7 @@ struct OtherSettingsView: View {
             .foregroundColor(.secondary)
         }
         .help(
-          "\(row.name) isn't connected right now. It still triggers the switch when it next connects. Display ID: \(row.id)."
+          "\(row.name) isn't connected right now. It triggers the switch when it next connects, or when this Mac wakes with it connected. Display ID: \(row.id)."
         )
         Spacer()
         Button(action: { displayMonitor.setTriggerEnabled(false, id: row.id, name: row.name) }) {
