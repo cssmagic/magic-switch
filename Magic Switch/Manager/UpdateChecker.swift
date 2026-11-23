@@ -22,10 +22,8 @@ final class UpdateChecker: ObservableObject {
   // MARK: - Constants
 
   private enum Constants {
-    /// Owner/repo whose published Releases define the latest version. Casing
-    /// matches the existing GitHub links elsewhere in the app; GitHub treats
-    /// owner/repo case-insensitively regardless.
-    static let repoSlug = "MegaManSec/magic-switch"
+    /// Repository whose published releases are offered to users.
+    static let repoSlug = "cssmagic/magic-switch"
     /// `releases/latest` resolves to the most recent non-draft, non-prerelease
     /// release — exactly what semantic-release publishes.
     static let latestReleaseAPI = "https://api.github.com/repos/\(repoSlug)/releases/latest"
